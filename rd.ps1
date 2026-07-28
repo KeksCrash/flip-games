@@ -26,7 +26,7 @@ $ViewerHost = "0.0.0.0"
 $ViewerPort = 5900
 
 # Klassisches VNC-Passwort: maximal 8 Zeichen
-$pass = $VncPassword 
+$VncPassword = dragon
 
 # ==========================================================
 
