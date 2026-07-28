@@ -1,76 +1,183 @@
 #requires -RunAsAdministrator
-
 # ============================================================
-# KURZE OPTIONALE VARIABLEN VOR IEX
-#
-# $s  = Dauer Maus/Tastatur in Sekunden
-# $cs = Controller-Dauer; nicht gesetzt/null = Wert von $s
-# $m  = Maus blockieren
-# $k  = Tastatur blockieren
-# $c  = Sony-Controller blockieren
-#
-# Beispiele:
-# $s=36;irm 'URL'|iex
-# $s=36;$cs=15;irm 'URL'|iex
-# $s=20;$m=$false;$k=$false;$c=$true;irm 'URL'|iex
-#
-# Lange alte Variablennamen werden weiterhin übernommen.
+# SSH-/TASK-VARIANTE: disableIO / enableIO
 # ============================================================
 
-if (-not (Test-Path variable:s)) {
-    if (Test-Path variable:seconds) { $s = $seconds } else { $s = 60 }
-}
-if (-not (Test-Path variable:cs)) {
-    if (Test-Path variable:CSeconds) { $cs = $CSeconds }
-    elseif (Test-Path variable:controllerSeconds) { $cs = $controllerSeconds }
-    else { $cs = $null }
-}
-if (-not (Test-Path variable:m)) {
-    if (Test-Path variable:blockMouse) { $m = $blockMouse } else { $m = $true }
-}
-if (-not (Test-Path variable:k)) {
-    if (Test-Path variable:blockKeyboard) { $k = $blockKeyboard } else { $k = $true }
-}
-if (-not (Test-Path variable:c)) {
-    if (Test-Path variable:blockController) { $c = $blockController } else { $c = $true }
+if (-not (Test-Path variable:ioUrl)) {
+    $ioUrl = 'https://raw.githubusercontent.com/KeksCrash/flip-games/refs/heads/master/IO.ps1'
 }
 
-$s = [Math]::Max(1, [int]$s)
-if ($null -eq $cs -or [string]::IsNullOrWhiteSpace([string]$cs)) {
-    $cs = $s
-} else {
-    $cs = [Math]::Max(1, [int]$cs)
+if (Test-Path variable:enableIO) {
+    if ($enableIO) {
+        Stop-ScheduledTask -TaskName 'DisableIO' -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName 'DisableIO' -Confirm:$false -ErrorAction SilentlyContinue
+
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -match '^(powershell|pwsh)\.exe$' -and
+                $_.CommandLine -match 'DisableIOProcess|InputBlockMouse|InputBlockKeyboard'
+            } |
+            ForEach-Object {
+                Invoke-CimMethod -InputObject $_ -MethodName Terminate -ErrorAction SilentlyContinue |
+                    Out-Null
+            }
+
+        Get-PnpDevice -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Status -ne 'OK' -and
+                (
+                    $_.Class -in @('Mouse', 'Keyboard', 'HIDClass') -or
+                    $_.InstanceId -match 'VID_054C'
+                )
+            } |
+            Enable-PnpDevice -Confirm:$false -ErrorAction SilentlyContinue
+
+        Write-Host 'Eingaben wurden wieder aktiviert.'
+        return
+    }
 }
 
-$m = [bool]$m
-$k = [bool]$k
-$c = [bool]$c
+if (Test-Path variable:disableIO) {
+    if ($disableIO -and -not (Test-Path variable:DisableIOProcess)) {
+        $user = (Get-CimInstance Win32_ComputerSystem).UserName
 
-$seconds = $s
-$CSeconds = $cs
-$blockMouse = $m
-$blockKeyboard = $k
-$blockController = $c
+        if (-not $user) {
+            throw 'Kein interaktiv angemeldeter Windows-Benutzer gefunden.'
+        }
+
+        if (-not (Test-Path variable:seconds)) {
+            $seconds = 60
+        }
+
+        if (-not (Test-Path variable:CSeconds)) {
+            $CSeconds = $seconds
+        }
+
+        if (-not (Test-Path variable:blockMouse)) {
+            $blockMouse = $true
+        }
+
+        if (-not (Test-Path variable:blockKeyboard)) {
+            $blockKeyboard = $true
+        }
+
+        if (-not (Test-Path variable:blockController)) {
+            $blockController = $true
+        }
+
+        $payload = @"
+`$DisableIOProcess = `$true
+`$seconds = $([int]$seconds)
+`$CSeconds = $([int]$CSeconds)
+`$blockMouse = `$$blockMouse
+`$blockKeyboard = `$$blockKeyboard
+`$blockController = `$$blockController
+irm '$ioUrl' | iex
+"@
+
+        $encoded = [Convert]::ToBase64String(
+            [Text.Encoding]::Unicode.GetBytes($payload)
+        )
+
+        $action = New-ScheduledTaskAction `
+            -Execute 'powershell.exe' `
+            -Argument "-NoProfile -WindowStyle Hidden -EncodedCommand $encoded"
+
+        $principal = New-ScheduledTaskPrincipal `
+            -UserId $user `
+            -LogonType Interactive `
+            -RunLevel Highest
+
+        $settings = New-ScheduledTaskSettingsSet `
+            -ExecutionTimeLimit (New-TimeSpan -Seconds ([int]$seconds + 120)) `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries
+
+        Register-ScheduledTask `
+            -TaskName 'DisableIO' `
+            -Action $action `
+            -Principal $principal `
+            -Settings $settings `
+            -Force |
+            Out-Null
+
+        Start-ScheduledTask -TaskName 'DisableIO'
+
+        Write-Host "DisableIO gestartet: $seconds Sekunden"
+        Write-Host 'Notfall-Freigabe: $enableIO=$true; irm $ioUrl | iex'
+        return
+    }
+}
+# ============================================================
+# OPTIONALE VARIABLEN
+#
+# Diese Variablen können VOR dem Aufruf per IEX gesetzt werden:
+#
+# $seconds = 60
+# $CSeconds = 30
+# $blockMouse = $true
+# $blockKeyboard = $true
+# $blockController = $true
+#
+# Beispiel:
+#
+# $seconds=60;$CSeconds=20;$blockController=$true;
+# irm 'URL-ZUM-SKRIPT.ps1' | iex
+#
+# Nicht gesetzte Variablen erhalten die folgenden Standardwerte.
+# ============================================================
+
+if (-not (Test-Path variable:seconds)) {
+    $seconds = 60
+}
+
+if (-not (Test-Path variable:CSeconds)) {
+    $CSeconds = $null
+}
+
+if (-not (Test-Path variable:blockMouse)) {
+    $blockMouse = $true
+}
+
+if (-not (Test-Path variable:blockKeyboard)) {
+    $blockKeyboard = $true
+}
+
+if (-not (Test-Path variable:blockController)) {
+    $blockController = $true
+}
+
+$seconds = [Math]::Max(1, [int]$seconds)
+
+if ($null -eq $CSeconds -or "$CSeconds".Trim() -eq '') {
+    $CSeconds = $seconds
+}
+else {
+    $CSeconds = [Math]::Max(1, [int]$CSeconds)
+}
 
 $timeFile = Join-Path $env:TEMP 'input-block-time.txt'
-$s | Set-Content -LiteralPath $timeFile -Force
+$seconds | Set-Content -LiteralPath $timeFile -Force
 
-Write-Host "Maus/Tastatur: $s s | Controller: $cs s | M:$m K:$k C:$c"
+Write-Host "Maus/Tastatur-Dauer: $seconds Sekunden"
+Write-Host "Controller-Dauer:     $CSeconds Sekunden"
+Write-Host "Maus blockieren:       $blockMouse"
+Write-Host "Tastatur blockieren:   $blockKeyboard"
+Write-Host "Controller blockieren: $blockController"
 
 # ============================================================
-# SONY-DUALSHOCK-/DUALSENSE-EINGABEGERÄT SUCHEN
-# Nur HID-Gamecontroller; Audio- und Bluetooth-Teilgeräte bleiben aktiv.
+# PS4-/DUALSHOCK-CONTROLLER SUCHEN
+# Sony Vendor-ID: VID_054C
 # ============================================================
 
 $ps4Controllers = @()
 
-if ($c) {
+if ($blockController) {
     $ps4Controllers = @(
         Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
             Where-Object {
-                $_.Class -eq 'HIDClass' -and
-                $_.InstanceId -match 'VID_054C' -and
-                $_.FriendlyName -match 'HID-compliant game controller|HID-konformer Gamecontroller'
+                $_.InstanceId -match 'VID_054C' -or
+                $_.FriendlyName -match 'Wireless Controller|DualShock|DUALSHOCK|PS4 Controller'
             } |
             Sort-Object InstanceId -Unique
     )
@@ -450,12 +557,10 @@ $controllerRestoreJob = {
     Start-Sleep -Seconds $Duration
 
     foreach ($instanceId in $InstanceIds) {
-        try {
-            Enable-PnpDevice -InstanceId $instanceId -Confirm:$false -ErrorAction Stop
-        }
-        catch {
-            & "$env:SystemRoot\System32\pnputil.exe" /enable-device "$instanceId" | Out-Null
-        }
+        Enable-PnpDevice `
+            -InstanceId $instanceId `
+            -Confirm:$false `
+            -ErrorAction SilentlyContinue
     }
 }
 
@@ -480,89 +585,61 @@ try {
         -ErrorAction SilentlyContinue |
         Remove-Job -Force -ErrorAction SilentlyContinue
 
-    # Sony-Controller-Eingabe deaktivieren
-    if ($c) {
+    # PS4-Controller deaktivieren
+    if ($blockController) {
         if ($ps4Controllers.Count -gt 0) {
-            $disabledControllers = @()
-
             foreach ($controller in $ps4Controllers) {
-                try {
-                    Write-Host "Controller aus: $($controller.FriendlyName)"
-                    Disable-PnpDevice `
-                        -InstanceId $controller.InstanceId `
-                        -Confirm:$false `
-                        -ErrorAction Stop
+                Write-Host "Deaktiviere Controller: $($controller.FriendlyName)"
 
-                    $disabledControllers += $controller
-                }
-                catch {
-                    try {
-                        & "$env:SystemRoot\System32\pnputil.exe" `
-                            /disable-device "$($controller.InstanceId)" | Out-Null
-
-                        $state = Get-PnpDevice `
-                            -InstanceId $controller.InstanceId `
-                            -ErrorAction SilentlyContinue
-
-                        if ($state.Status -ne 'OK') {
-                            $disabledControllers += $controller
-                        }
-                        else {
-                            Write-Warning "Controller konnte nicht deaktiviert werden."
-                        }
-                    }
-                    catch {
-                        Write-Warning "Controllerfehler: $($_.Exception.Message)"
-                    }
-                }
+                Disable-PnpDevice `
+                    -InstanceId $controller.InstanceId `
+                    -Confirm:$false `
+                    -ErrorAction Stop
             }
 
-            if ($disabledControllers.Count -gt 0) {
-                $controllerDisabled = $true
-                $ps4Controllers = @($disabledControllers)
-                $controllerIds = [string[]]@($ps4Controllers.InstanceId)
+            $controllerDisabled = $true
+            $controllerIds = @($ps4Controllers.InstanceId)
 
-                $controllerJob = Start-Job `
-                    -Name InputBlockControllerRestore `
-                    -ScriptBlock $controllerRestoreJob `
-                    -ArgumentList (,$controllerIds), $cs
+            $controllerJob = Start-Job `
+                -Name InputBlockControllerRestore `
+                -ScriptBlock $controllerRestoreJob `
+                -ArgumentList $controllerIds, $CSeconds
 
-                $createdJobs.Add($controllerJob)
-            }
+            $createdJobs.Add($controllerJob)
         }
         else {
-            Write-Warning 'Kein Sony-HID-Gamecontroller gefunden.'
+            Write-Warning 'Kein PS4-/DualShock-Controller gefunden.'
         }
     }
 
     # Mausposition festhalten
-    if ($m) {
+    if ($blockMouse) {
         $positionJob = Start-Job `
             -Name InputBlockMousePosition `
             -ScriptBlock $mousePositionJob `
-            -ArgumentList $s, $timeFile
+            -ArgumentList $seconds, $timeFile
 
         $createdJobs.Add($positionJob)
 
         $mouseJob = Start-Job `
             -Name InputBlockMouseHook `
             -ScriptBlock $mouseHookJob `
-            -ArgumentList ($s * 1000)
+            -ArgumentList ($seconds * 1000)
 
         $createdJobs.Add($mouseJob)
     }
 
     # Tastatur blockieren
-    if ($k) {
+    if ($blockKeyboard) {
         $keyboardJob = Start-Job `
             -Name InputBlockKeyboardHook `
             -ScriptBlock $keyboardHookJob `
-            -ArgumentList ($s * 1000)
+            -ArgumentList ($seconds * 1000)
 
         $createdJobs.Add($keyboardJob)
     }
 
-    Start-Sleep -Seconds $s
+    Start-Sleep -Seconds $seconds
 }
 finally {
     # Maus- und Tastaturjobs beenden
@@ -591,21 +668,15 @@ finally {
             Remove-Job $restoreJob -Force -ErrorAction SilentlyContinue
             $controllerDisabled = $false
         }
-        elseif ($cs -le $s) {
+        elseif ($CSeconds -le $seconds) {
             Stop-Job $restoreJob -ErrorAction SilentlyContinue
             Remove-Job $restoreJob -Force -ErrorAction SilentlyContinue
 
             foreach ($controller in $ps4Controllers) {
-                try {
-                    Enable-PnpDevice `
-                        -InstanceId $controller.InstanceId `
-                        -Confirm:$false `
-                        -ErrorAction Stop
-                }
-                catch {
-                    & "$env:SystemRoot\System32\pnputil.exe" `
-                        /enable-device "$($controller.InstanceId)" | Out-Null
-                }
+                Enable-PnpDevice `
+                    -InstanceId $controller.InstanceId `
+                    -Confirm:$false `
+                    -ErrorAction SilentlyContinue
             }
 
             $controllerDisabled = $false
@@ -613,22 +684,16 @@ finally {
         else {
             Write-Host (
                 "Der Controller bleibt noch {0} Sekunden deaktiviert." -f
-                ($cs - $s)
+                ($CSeconds - $seconds)
             )
         }
     }
     elseif ($controllerDisabled) {
         foreach ($controller in $ps4Controllers) {
-            try {
-                Enable-PnpDevice `
-                    -InstanceId $controller.InstanceId `
-                    -Confirm:$false `
-                    -ErrorAction Stop
-            }
-            catch {
-                & "$env:SystemRoot\System32\pnputil.exe" `
-                    /enable-device "$($controller.InstanceId)" | Out-Null
-            }
+            Enable-PnpDevice `
+                -InstanceId $controller.InstanceId `
+                -Confirm:$false `
+                -ErrorAction SilentlyContinue
         }
     }
 
