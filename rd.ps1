@@ -827,6 +827,7 @@ $($ServerProcess.ExitCode)
     Write-Host "Es wurde kein UltraVNC-Dienst installiert."
     Write-Host "Es wurde kein Autostart-Eintrag erstellt."
     Write-Host "Die Konfiguration liegt neben winvnc.exe."
+    Write-Host  $pass
 }
 catch {
 
