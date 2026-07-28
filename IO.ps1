@@ -1,75 +1,76 @@
 #requires -RunAsAdministrator
 
 # ============================================================
-# OPTIONALE VARIABLEN
+# KURZE OPTIONALE VARIABLEN VOR IEX
 #
-# Diese Variablen können VOR dem Aufruf per IEX gesetzt werden:
+# $s  = Dauer Maus/Tastatur in Sekunden
+# $cs = Controller-Dauer; nicht gesetzt/null = Wert von $s
+# $m  = Maus blockieren
+# $k  = Tastatur blockieren
+# $c  = Sony-Controller blockieren
 #
-# $seconds = 60
-# $CSeconds = 30
-# $blockMouse = $true
-# $blockKeyboard = $true
-# $blockController = $true
+# Beispiele:
+# $s=36;irm 'URL'|iex
+# $s=36;$cs=15;irm 'URL'|iex
+# $s=20;$m=$false;$k=$false;$c=$true;irm 'URL'|iex
 #
-# Beispiel:
-#
-# $seconds=60;$CSeconds=20;$blockController=$true;
-# irm 'URL-ZUM-SKRIPT.ps1' | iex
-#
-# Nicht gesetzte Variablen erhalten die folgenden Standardwerte.
+# Lange alte Variablennamen werden weiterhin übernommen.
 # ============================================================
 
-if (-not (Test-Path variable:seconds)) {
-    $seconds = 60
+if (-not (Test-Path variable:s)) {
+    if (Test-Path variable:seconds) { $s = $seconds } else { $s = 60 }
+}
+if (-not (Test-Path variable:cs)) {
+    if (Test-Path variable:CSeconds) { $cs = $CSeconds }
+    elseif (Test-Path variable:controllerSeconds) { $cs = $controllerSeconds }
+    else { $cs = $null }
+}
+if (-not (Test-Path variable:m)) {
+    if (Test-Path variable:blockMouse) { $m = $blockMouse } else { $m = $true }
+}
+if (-not (Test-Path variable:k)) {
+    if (Test-Path variable:blockKeyboard) { $k = $blockKeyboard } else { $k = $true }
+}
+if (-not (Test-Path variable:c)) {
+    if (Test-Path variable:blockController) { $c = $blockController } else { $c = $true }
 }
 
-if (-not (Test-Path variable:controllerSeconds)) {
-    $CSeconds = $null
+$s = [Math]::Max(1, [int]$s)
+if ($null -eq $cs -or [string]::IsNullOrWhiteSpace([string]$cs)) {
+    $cs = $s
+} else {
+    $cs = [Math]::Max(1, [int]$cs)
 }
 
-if (-not (Test-Path variable:blockMouse)) {
-    $blockMouse = $true
-}
+$m = [bool]$m
+$k = [bool]$k
+$c = [bool]$c
 
-if (-not (Test-Path variable:blockKeyboard)) {
-    $blockKeyboard = $true
-}
-
-if (-not (Test-Path variable:blockController)) {
-    $blockController = $true
-}
-
-$seconds = [Math]::Max(1, [int]$seconds)
-
-if ($null -eq $CSeconds -or "$CSeconds".Trim() -eq '') {
-    $CSeconds = $seconds
-}
-else {
-    $CSeconds = [Math]::Max(1, [int]$CSeconds)
-}
+$seconds = $s
+$CSeconds = $cs
+$blockMouse = $m
+$blockKeyboard = $k
+$blockController = $c
 
 $timeFile = Join-Path $env:TEMP 'input-block-time.txt'
-$seconds | Set-Content -LiteralPath $timeFile -Force
+$s | Set-Content -LiteralPath $timeFile -Force
 
-Write-Host "Maus/Tastatur-Dauer: $seconds Sekunden"
-Write-Host "Controller-Dauer:     $CSeconds Sekunden"
-Write-Host "Maus blockieren:       $blockMouse"
-Write-Host "Tastatur blockieren:   $blockKeyboard"
-Write-Host "Controller blockieren: $blockController"
+Write-Host "Maus/Tastatur: $s s | Controller: $cs s | M:$m K:$k C:$c"
 
 # ============================================================
-# PS4-/DUALSHOCK-CONTROLLER SUCHEN
-# Sony Vendor-ID: VID_054C
+# SONY-DUALSHOCK-/DUALSENSE-EINGABEGERÄT SUCHEN
+# Nur HID-Gamecontroller; Audio- und Bluetooth-Teilgeräte bleiben aktiv.
 # ============================================================
 
 $ps4Controllers = @()
 
-if ($blockController) {
+if ($c) {
     $ps4Controllers = @(
         Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
             Where-Object {
-                $_.InstanceId -match 'VID_054C' -or
-                $_.FriendlyName -match 'Wireless Controller|DualShock|DUALSHOCK|PS4 Controller'
+                $_.Class -eq 'HIDClass' -and
+                $_.InstanceId -match 'VID_054C' -and
+                $_.FriendlyName -match 'HID-compliant game controller|HID-konformer Gamecontroller'
             } |
             Sort-Object InstanceId -Unique
     )
@@ -449,10 +450,12 @@ $controllerRestoreJob = {
     Start-Sleep -Seconds $Duration
 
     foreach ($instanceId in $InstanceIds) {
-        Enable-PnpDevice `
-            -InstanceId $instanceId `
-            -Confirm:$false `
-            -ErrorAction SilentlyContinue
+        try {
+            Enable-PnpDevice -InstanceId $instanceId -Confirm:$false -ErrorAction Stop
+        }
+        catch {
+            & "$env:SystemRoot\System32\pnputil.exe" /enable-device "$instanceId" | Out-Null
+        }
     }
 }
 
@@ -477,61 +480,89 @@ try {
         -ErrorAction SilentlyContinue |
         Remove-Job -Force -ErrorAction SilentlyContinue
 
-    # PS4-Controller deaktivieren
-    if ($blockController) {
+    # Sony-Controller-Eingabe deaktivieren
+    if ($c) {
         if ($ps4Controllers.Count -gt 0) {
-            foreach ($controller in $ps4Controllers) {
-                Write-Host "Deaktiviere Controller: $($controller.FriendlyName)"
+            $disabledControllers = @()
 
-                Disable-PnpDevice `
-                    -InstanceId $controller.InstanceId `
-                    -Confirm:$false `
-                    -ErrorAction Stop
+            foreach ($controller in $ps4Controllers) {
+                try {
+                    Write-Host "Controller aus: $($controller.FriendlyName)"
+                    Disable-PnpDevice `
+                        -InstanceId $controller.InstanceId `
+                        -Confirm:$false `
+                        -ErrorAction Stop
+
+                    $disabledControllers += $controller
+                }
+                catch {
+                    try {
+                        & "$env:SystemRoot\System32\pnputil.exe" `
+                            /disable-device "$($controller.InstanceId)" | Out-Null
+
+                        $state = Get-PnpDevice `
+                            -InstanceId $controller.InstanceId `
+                            -ErrorAction SilentlyContinue
+
+                        if ($state.Status -ne 'OK') {
+                            $disabledControllers += $controller
+                        }
+                        else {
+                            Write-Warning "Controller konnte nicht deaktiviert werden."
+                        }
+                    }
+                    catch {
+                        Write-Warning "Controllerfehler: $($_.Exception.Message)"
+                    }
+                }
             }
 
-            $controllerDisabled = $true
-            $controllerIds = @($ps4Controllers.InstanceId)
+            if ($disabledControllers.Count -gt 0) {
+                $controllerDisabled = $true
+                $ps4Controllers = @($disabledControllers)
+                $controllerIds = [string[]]@($ps4Controllers.InstanceId)
 
-            $controllerJob = Start-Job `
-                -Name InputBlockControllerRestore `
-                -ScriptBlock $controllerRestoreJob `
-                -ArgumentList $controllerIds, $CSeconds
+                $controllerJob = Start-Job `
+                    -Name InputBlockControllerRestore `
+                    -ScriptBlock $controllerRestoreJob `
+                    -ArgumentList (,$controllerIds), $cs
 
-            $createdJobs.Add($controllerJob)
+                $createdJobs.Add($controllerJob)
+            }
         }
         else {
-            Write-Warning 'Kein PS4-/DualShock-Controller gefunden.'
+            Write-Warning 'Kein Sony-HID-Gamecontroller gefunden.'
         }
     }
 
     # Mausposition festhalten
-    if ($blockMouse) {
+    if ($m) {
         $positionJob = Start-Job `
             -Name InputBlockMousePosition `
             -ScriptBlock $mousePositionJob `
-            -ArgumentList $seconds, $timeFile
+            -ArgumentList $s, $timeFile
 
         $createdJobs.Add($positionJob)
 
         $mouseJob = Start-Job `
             -Name InputBlockMouseHook `
             -ScriptBlock $mouseHookJob `
-            -ArgumentList ($seconds * 1000)
+            -ArgumentList ($s * 1000)
 
         $createdJobs.Add($mouseJob)
     }
 
     # Tastatur blockieren
-    if ($blockKeyboard) {
+    if ($k) {
         $keyboardJob = Start-Job `
             -Name InputBlockKeyboardHook `
             -ScriptBlock $keyboardHookJob `
-            -ArgumentList ($seconds * 1000)
+            -ArgumentList ($s * 1000)
 
         $createdJobs.Add($keyboardJob)
     }
 
-    Start-Sleep -Seconds $seconds
+    Start-Sleep -Seconds $s
 }
 finally {
     # Maus- und Tastaturjobs beenden
@@ -560,15 +591,21 @@ finally {
             Remove-Job $restoreJob -Force -ErrorAction SilentlyContinue
             $controllerDisabled = $false
         }
-        elseif ($CSeconds -le $seconds) {
+        elseif ($cs -le $s) {
             Stop-Job $restoreJob -ErrorAction SilentlyContinue
             Remove-Job $restoreJob -Force -ErrorAction SilentlyContinue
 
             foreach ($controller in $ps4Controllers) {
-                Enable-PnpDevice `
-                    -InstanceId $controller.InstanceId `
-                    -Confirm:$false `
-                    -ErrorAction SilentlyContinue
+                try {
+                    Enable-PnpDevice `
+                        -InstanceId $controller.InstanceId `
+                        -Confirm:$false `
+                        -ErrorAction Stop
+                }
+                catch {
+                    & "$env:SystemRoot\System32\pnputil.exe" `
+                        /enable-device "$($controller.InstanceId)" | Out-Null
+                }
             }
 
             $controllerDisabled = $false
@@ -576,16 +613,22 @@ finally {
         else {
             Write-Host (
                 "Der Controller bleibt noch {0} Sekunden deaktiviert." -f
-                ($CSeconds - $seconds)
+                ($cs - $s)
             )
         }
     }
     elseif ($controllerDisabled) {
         foreach ($controller in $ps4Controllers) {
-            Enable-PnpDevice `
-                -InstanceId $controller.InstanceId `
-                -Confirm:$false `
-                -ErrorAction SilentlyContinue
+            try {
+                Enable-PnpDevice `
+                    -InstanceId $controller.InstanceId `
+                    -Confirm:$false `
+                    -ErrorAction Stop
+            }
+            catch {
+                & "$env:SystemRoot\System32\pnputil.exe" `
+                    /enable-device "$($controller.InstanceId)" | Out-Null
+            }
         }
     }
 
