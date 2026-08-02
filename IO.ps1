@@ -1,6 +1,11 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 #requires -RunAsAdministrator
 
+# BUILD: IO-2026-08-02-2035-NOPARAM
+# Kein globaler CmdletBinding-/param-Block.
+# Empfohlener Start: zuerst nach %TEMP% laden, mit dem PowerShell-Parser
+# pruefen und danach als Datei ausfuehren; nicht direkt per iex.
+$DisableIOBuild = 'IO-2026-08-02-2035-NOPARAM'
 # Kein param()-Block: Dadurch funktioniert die Datei sowohl mit
 # "irm <URL> | iex" als auch mit "powershell.exe -File IO.ps1 ...".
 # Bei einem direkten -File-Aufruf werden bekannte Argumente hier ausgewertet.
