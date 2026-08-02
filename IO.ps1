@@ -1,49 +1,140 @@
-```powershell
+#requires -Version 5.1
 #requires -RunAsAdministrator
 
-# ============================================================
-# IO.ps1
-#
-# KURZE VARIABLEN:
-#
-# $s  = Dauer Maus/Tastatur
-# $cs = Dauer Controller
-# $m  = Maus blockieren
-# $k  = Tastatur blockieren
-# $c  = Controller blockieren
-#
-# SSH-Start:
-#
-# $disableIO=$true;$s=60;$cs=60;$m=$true;$k=$true;$c=$true;
-# irm 'https://raw.githubusercontent.com/KeksCrash/flip-games/refs/heads/master/IO.ps1' | iex
-#
-# Sofortige Freigabe:
-#
-# $enableIO=$true;
-# irm 'https://raw.githubusercontent.com/KeksCrash/flip-games/refs/heads/master/IO.ps1' | iex
-#
-# Direkter lokaler Start:
-#
-# $s=60;$cs=30;$m=$true;$k=$true;$c=$true;
-# irm 'URL-ZUM-SKRIPT' | iex
-# ============================================================
+[CmdletBinding()]
+param(
+    [switch]$InternalWorker,
+    [Alias('EnableIO')]
+    [switch]$Release,
+
+    [ValidateRange(1, 86400)]
+    [int]$Duration = 60,
+
+    [ValidateRange(0, 86400)]
+    [int]$ControllerDuration = 0,
+
+    [switch]$NoMouse,
+    [switch]$NoKeyboard,
+    [switch]$NoController,
+
+    [string]$SourceUrl = 'https://raw.githubusercontent.com/KeksCrash/flip-games/refs/heads/master/IO.ps1'
+)
 
 $ErrorActionPreference = 'Stop'
 
 # ============================================================
-# FESTE NAMEN UND DATEIEN
+# LEGACY-VARIABLEN AUS irm ... | iex UNTERSTÜTZEN
 # ============================================================
 
-$taskName       = 'DisableIO'
-$pidFile        = Join-Path $env:TEMP 'disable-io.pid'
-$controllerFile = Join-Path $env:TEMP 'disable-io-controllers.txt'
+if (Test-Path variable:s) {
+    $Duration = [int]$s
+}
+elseif (Test-Path variable:seconds) {
+    $Duration = [int]$seconds
+}
 
-if (-not (Test-Path variable:ioUrl)) {
-    $ioUrl = 'https://raw.githubusercontent.com/KeksCrash/flip-games/refs/heads/master/IO.ps1'
+if (Test-Path variable:cs) {
+    $ControllerDuration = [int]$cs
+}
+elseif (Test-Path variable:CSeconds) {
+    $ControllerDuration = [int]$CSeconds
+}
+
+$legacyBlockMouseSet = Test-Path variable:blockMouse
+$legacyBlockMouse = if ($legacyBlockMouseSet) {
+    [bool](Get-Variable blockMouse -ValueOnly)
+}
+else {
+    $null
+}
+
+$legacyBlockKeyboardSet = Test-Path variable:blockKeyboard
+$legacyBlockKeyboard = if ($legacyBlockKeyboardSet) {
+    [bool](Get-Variable blockKeyboard -ValueOnly)
+}
+else {
+    $null
+}
+
+$legacyBlockControllerSet = Test-Path variable:blockController
+$legacyBlockController = if ($legacyBlockControllerSet) {
+    [bool](Get-Variable blockController -ValueOnly)
+}
+else {
+    $null
+}
+
+$blockMouse = -not $NoMouse
+if (Test-Path variable:m) {
+    $blockMouse = [bool]$m
+}
+elseif ($legacyBlockMouseSet) {
+    $blockMouse = $legacyBlockMouse
+}
+
+$blockKeyboard = -not $NoKeyboard
+if (Test-Path variable:k) {
+    $blockKeyboard = [bool]$k
+}
+elseif ($legacyBlockKeyboardSet) {
+    $blockKeyboard = $legacyBlockKeyboard
+}
+
+$blockController = -not $NoController
+if (Test-Path variable:c) {
+    $blockController = [bool]$c
+}
+elseif ($legacyBlockControllerSet) {
+    $blockController = $legacyBlockController
+}
+
+if (Test-Path variable:ioUrl) {
+    $SourceUrl = [string]$ioUrl
+}
+
+$releaseRequested = $Release
+if ((Test-Path variable:enableIO) -and [bool]$enableIO) {
+    $releaseRequested = $true
+}
+
+$Duration = [Math]::Max(1, [int]$Duration)
+if ($ControllerDuration -le 0) {
+    $ControllerDuration = $Duration
+}
+else {
+    $ControllerDuration = [Math]::Max(1, [int]$ControllerDuration)
 }
 
 # ============================================================
-# HILFSFUNKTION: PROZESSBAUM BEENDEN
+# ALLE DATEIEN LIEGEN AUSSCHLIESSLICH IN %TEMP%\DisableIO
+# ============================================================
+
+$taskName       = 'DisableIO-Temp'
+$workRoot       = Join-Path ([IO.Path]::GetTempPath()) 'DisableIO'
+$tempScript     = Join-Path $workRoot 'IO.ps1'
+$pidFile        = Join-Path $workRoot 'worker.pid'
+$controllerFile = Join-Path $workRoot 'controllers.txt'
+$logFile        = Join-Path $workRoot 'DisableIO.log'
+
+# ============================================================
+# ADMINISTRATORSTATUS
+# ============================================================
+
+function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+
+    return $principal.IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator
+    )
+}
+
+if (-not (Test-IsAdministrator)) {
+    throw 'DisableIO muss mit Administratorrechten ausgeführt werden.'
+}
+
+# ============================================================
+# PROZESSBAUM BEENDEN
 # ============================================================
 
 function Stop-IOProcessTree {
@@ -56,7 +147,7 @@ function Stop-IOProcessTree {
         Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
     )
 
-    function Stop-ChildProcesses {
+    function Stop-Children {
         param([int]$ParentId)
 
         $children = @(
@@ -67,7 +158,7 @@ function Stop-IOProcessTree {
         )
 
         foreach ($child in $children) {
-            Stop-ChildProcesses -ParentId ([int]$child.ProcessId)
+            Stop-Children -ParentId ([int]$child.ProcessId)
 
             Invoke-CimMethod `
                 -InputObject $child `
@@ -77,7 +168,7 @@ function Stop-IOProcessTree {
         }
     }
 
-    Stop-ChildProcesses -ParentId $RootProcessId
+    Stop-Children -ParentId $RootProcessId
 
     $root = $allProcesses |
         Where-Object {
@@ -95,8 +186,54 @@ function Stop-IOProcessTree {
 }
 
 # ============================================================
-# HILFSFUNKTION: GERÄT AKTIVIEREN
+# PNP-GERÄTE AKTIVIEREN / DEAKTIVIEREN
 # ============================================================
+
+function Disable-IODevice {
+    param(
+        [Parameter(Mandatory)]
+        [string]$InstanceId
+    )
+
+    $powerShellError = $null
+
+    try {
+        Disable-PnpDevice `
+            -InstanceId $InstanceId `
+            -Confirm:$false `
+            -ErrorAction Stop
+
+        return [pscustomobject]@{
+            Success = $true
+            Detail  = 'Disable-PnpDevice'
+        }
+    }
+    catch {
+        $powerShellError = $_.Exception.Message
+    }
+
+    $pnpOutput = @(
+        & "$env:windir\System32\pnputil.exe" `
+            /disable-device "$InstanceId" /force 2>&1
+    )
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -eq 0) {
+        return [pscustomobject]@{
+            Success = $true
+            Detail  = 'PnPUtil'
+        }
+    }
+
+    return [pscustomobject]@{
+        Success = $false
+        Detail  = @(
+            "Disable-PnpDevice: $powerShellError"
+            "PnPUtil ExitCode: $exitCode"
+            ($pnpOutput -join "`n")
+        ) -join "`n"
+    }
+}
 
 function Enable-IODevice {
     param(
@@ -104,304 +241,191 @@ function Enable-IODevice {
         [string]$InstanceId
     )
 
+    $powerShellError = $null
+
     try {
         Enable-PnpDevice `
             -InstanceId $InstanceId `
             -Confirm:$false `
             -ErrorAction Stop
 
-        return $true
+        return [pscustomobject]@{
+            Success = $true
+            Detail  = 'Enable-PnpDevice'
+        }
     }
     catch {
-        & pnputil.exe /enable-device "$InstanceId" 2>$null |
-            Out-Null
+        $powerShellError = $_.Exception.Message
+    }
 
-        return ($LASTEXITCODE -eq 0)
+    $pnpOutput = @(
+        & "$env:windir\System32\pnputil.exe" `
+            /enable-device "$InstanceId" 2>&1
+    )
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -eq 0) {
+        return [pscustomobject]@{
+            Success = $true
+            Detail  = 'PnPUtil'
+        }
+    }
+
+    return [pscustomobject]@{
+        Success = $false
+        Detail  = @(
+            "Enable-PnpDevice: $powerShellError"
+            "PnPUtil ExitCode: $exitCode"
+            ($pnpOutput -join "`n")
+        ) -join "`n"
     }
 }
 
 # ============================================================
-# SOFORTIGE FREIGABE
+# CONTROLLER-GERÄTEBAUM
 # ============================================================
 
-if ((Test-Path variable:enableIO) -and $enableIO) {
-    Write-Host 'Beende DisableIO ...'
+function Get-PnpParentId {
+    param(
+        [Parameter(Mandatory)]
+        [string]$InstanceId
+    )
 
-    Stop-ScheduledTask `
-        -TaskName $taskName `
-        -ErrorAction SilentlyContinue
+    try {
+        $value = (
+            Get-PnpDeviceProperty `
+                -InstanceId $InstanceId `
+                -KeyName 'DEVPKEY_Device_Parent' `
+                -ErrorAction Stop
+        ).Data
 
-    Unregister-ScheduledTask `
-        -TaskName $taskName `
-        -Confirm:$false `
-        -ErrorAction SilentlyContinue
-
-    if (Test-Path -LiteralPath $pidFile) {
-        $savedPid = Get-Content `
-            -LiteralPath $pidFile `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-
-        if ($savedPid -match '^\d+$') {
-            Stop-IOProcessTree -RootProcessId ([int]$savedPid)
+        if ([string]::IsNullOrWhiteSpace([string]$value)) {
+            return $null
         }
+
+        return [string]$value
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-PnpDeviceChain {
+    param(
+        [Parameter(Mandatory)]
+        $Device
+    )
+
+    $chain = [System.Collections.Generic.List[object]]::new()
+    $current = $Device
+    $seen = @{}
+
+    for ($level = 0; $level -lt 12; $level++) {
+        if ($null -eq $current) {
+            break
+        }
+
+        $currentId = [string]$current.InstanceId
+        if ([string]::IsNullOrWhiteSpace($currentId)) {
+            break
+        }
+
+        if ($seen.ContainsKey($currentId)) {
+            break
+        }
+
+        $seen[$currentId] = $true
+        $chain.Add($current)
+
+        $parentId = Get-PnpParentId -InstanceId $currentId
+        if ([string]::IsNullOrWhiteSpace($parentId)) {
+            break
+        }
+
+        $current = Get-PnpDevice `
+            -InstanceId $parentId `
+            -ErrorAction SilentlyContinue
     }
 
-    if (Test-Path -LiteralPath $controllerFile) {
-        $controllerIds = @(
-            Get-Content `
-                -LiteralPath $controllerFile `
-                -ErrorAction SilentlyContinue |
-                Where-Object {
-                    -not [string]::IsNullOrWhiteSpace($_)
-                } |
-                Sort-Object -Unique
-        )
+    return @($chain)
+}
 
-        foreach ($id in $controllerIds) {
-            Write-Host "Aktiviere Controller: $id"
+function Resolve-ControllerTarget {
+    param(
+        [Parameter(Mandatory)]
+        $Device
+    )
 
-            if (-not (Enable-IODevice -InstanceId $id)) {
-                Write-Warning "Controller konnte nicht aktiviert werden: $id"
+    $chain = @(Get-PnpDeviceChain -Device $Device)
+
+    # Bei USB den höchsten gerätespezifischen VID/PID-Knoten nehmen,
+    # nicht nur das untergeordnete "HID-compliant game controller".
+    $usbTargets = @(
+        $chain |
+            Where-Object {
+                $id   = [string]$_.InstanceId
+                $name = [string]$_.FriendlyName
+
+                $id -match '(?i)^USB\\VID_[0-9A-F]{4}&PID_[0-9A-F]{4}' -and
+                $name -notmatch '(?i)Root Hub|Host Controller'
             }
-        }
-    }
-
-    Remove-Item `
-        -LiteralPath $pidFile, $controllerFile `
-        -Force `
-        -ErrorAction SilentlyContinue
-
-    Write-Host 'Maus, Tastatur und Controller wurden wieder freigegeben.'
-    return
-}
-
-# ============================================================
-# OPTIONALE VARIABLEN AUFLÖSEN
-# ============================================================
-
-if (Test-Path variable:s) {
-    $seconds = $s
-}
-elseif (-not (Test-Path variable:seconds)) {
-    $seconds = 60
-}
-
-if (Test-Path variable:cs) {
-    $CSeconds = $cs
-}
-elseif (-not (Test-Path variable:CSeconds)) {
-    $CSeconds = $null
-}
-
-if (Test-Path variable:m) {
-    $blockMouse = [bool]$m
-}
-elseif (-not (Test-Path variable:blockMouse)) {
-    $blockMouse = $true
-}
-
-if (Test-Path variable:k) {
-    $blockKeyboard = [bool]$k
-}
-elseif (-not (Test-Path variable:blockKeyboard)) {
-    $blockKeyboard = $true
-}
-
-if (Test-Path variable:c) {
-    $blockController = [bool]$c
-}
-elseif (-not (Test-Path variable:blockController)) {
-    $blockController = $true
-}
-
-$seconds = [Math]::Max(1, [int]$seconds)
-
-if (
-    $null -eq $CSeconds -or
-    [string]::IsNullOrWhiteSpace([string]$CSeconds)
-) {
-    $CSeconds = $seconds
-}
-else {
-    $CSeconds = [Math]::Max(1, [int]$CSeconds)
-}
-
-# ============================================================
-# SSH-VARIANTE
-#
-# Das eigentliche Skript wird als geplante Aufgabe in der
-# interaktiven Desktop-Sitzung gestartet.
-# ============================================================
-
-if (
-    (Test-Path variable:disableIO) -and
-    $disableIO -and
-    -not (Test-Path variable:DisableIOProcess)
-) {
-    $interactiveUser = (
-        Get-CimInstance Win32_ComputerSystem
-    ).UserName
-
-    if ([string]::IsNullOrWhiteSpace($interactiveUser)) {
-        throw 'Kein interaktiv angemeldeter Windows-Benutzer gefunden.'
-    }
-
-    $mouseLiteral = if ($blockMouse) {
-        '$true'
-    }
-    else {
-        '$false'
-    }
-
-    $keyboardLiteral = if ($blockKeyboard) {
-        '$true'
-    }
-    else {
-        '$false'
-    }
-
-    $controllerLiteral = if ($blockController) {
-        '$true'
-    }
-    else {
-        '$false'
-    }
-
-    $payload = @"
-`$DisableIOProcess = `$true
-`$seconds = $seconds
-`$CSeconds = $CSeconds
-`$blockMouse = $mouseLiteral
-`$blockKeyboard = $keyboardLiteral
-`$blockController = $controllerLiteral
-`$ioUrl = '$($ioUrl.Replace("'", "''"))'
-irm `$ioUrl | iex
-"@
-
-    $encodedPayload = [Convert]::ToBase64String(
-        [Text.Encoding]::Unicode.GetBytes($payload)
     )
 
-    $action = New-ScheduledTaskAction `
-        -Execute 'powershell.exe' `
-        -Argument (
-            '-NoProfile -ExecutionPolicy Bypass ' +
-            '-WindowStyle Hidden ' +
-            "-EncodedCommand $encodedPayload"
-        )
+    if ($usbTargets.Count -gt 0) {
+        return $usbTargets[-1]
+    }
 
-    $principal = New-ScheduledTaskPrincipal `
-        -UserId $interactiveUser `
-        -LogonType Interactive `
-        -RunLevel Highest
+    # Bei Bluetooth nur den Controller-Zweig wählen, niemals den Adapter.
+    $bluetoothTargets = @(
+        $chain |
+            Where-Object {
+                $id   = [string]$_.InstanceId
+                $name = [string]$_.FriendlyName
 
-    $maximumDuration = [Math]::Max(
-        $seconds,
-        $CSeconds
+                $id -match '(?i)^(BTHENUM|BTHLEDEVICE)\\' -and
+                $name -notmatch '(?i)Bluetooth.*Adapter|Radio|Enumerator'
+            }
     )
 
-    $settings = New-ScheduledTaskSettingsSet `
-        -ExecutionTimeLimit (
-            New-TimeSpan -Seconds ($maximumDuration + 180)
-        ) `
-        -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries
+    if ($bluetoothTargets.Count -gt 0) {
+        return $bluetoothTargets[0]
+    }
 
-    Stop-ScheduledTask `
-        -TaskName $taskName `
-        -ErrorAction SilentlyContinue
-
-    Unregister-ScheduledTask `
-        -TaskName $taskName `
-        -Confirm:$false `
-        -ErrorAction SilentlyContinue
-
-    Register-ScheduledTask `
-        -TaskName $taskName `
-        -Action $action `
-        -Principal $principal `
-        -Settings $settings `
-        -Force |
-        Out-Null
-
-    Start-ScheduledTask -TaskName $taskName
-
-    Write-Host "DisableIO wurde für $interactiveUser gestartet."
-    Write-Host "Maus/Tastatur: $seconds Sekunden"
-    Write-Host "Controller:    $CSeconds Sekunden"
-    Write-Host ''
-    Write-Host 'Notfallfreigabe:'
-    Write-Host "`$enableIO=`$true;irm '$ioUrl'|iex"
-    return
+    # Virtuelle oder nicht auflösbare Controller: den erkannten
+    # Gamecontroller-Knoten selbst verwenden.
+    return $Device
 }
 
-# ============================================================
-# INTERAKTIVER HAUPTPROZESS
-# ============================================================
-
-$PID |
-    Set-Content `
-        -LiteralPath $pidFile `
-        -Force
-
-Write-Host ''
-Write-Host '================ DisableIO ================'
-Write-Host "Maus/Tastatur: $seconds Sekunden"
-Write-Host "Controller:    $CSeconds Sekunden"
-Write-Host "Maus:          $blockMouse"
-Write-Host "Tastatur:      $blockKeyboard"
-Write-Host "Controller:    $blockController"
-Write-Host '==========================================='
-Write-Host ''
-
-# ============================================================
-# GAMECONTROLLER SUCHEN
-#
-# Erkannt werden unter anderem:
-#
-# - DualShock 4
-# - DualSense
-# - Xbox 360 / One / Series
-# - DS4Windows
-# - ViGEm virtuelle Xbox-/DS4-Controller
-# - Nintendo Switch Pro Controller
-# - Joy-Con
-# - Logitech
-# - Thrustmaster
-# - generische HID-Gamecontroller
-#
-# Audio, Maus, Tastatur, Touchpad und ViGEm-Bus selbst werden
-# ausgeschlossen.
-# ============================================================
-
-$controllers = @()
-
-if ($blockController) {
-    $controllers = @(
+function Get-ControllerTargets {
+    $leaves = @(
         Get-PnpDevice `
             -PresentOnly `
             -ErrorAction SilentlyContinue |
             Where-Object {
                 $name = [string]$_.FriendlyName
-                $id   = [string]$_.InstanceId
                 $cls  = [string]$_.Class
 
-                $controllerNameMatch =
+                $allowedClass =
+                    $cls -in @(
+                        'HIDClass',
+                        'GameController',
+                        'XnaComposite',
+                        'XboxComposite'
+                    )
+
+                $controllerName =
                     $name -match '(?i)' +
-                    'HID-compliant game controller|' +
-                    'HID-konformer Gamecontroller|' +
+                    '^HID-compliant game controller$|' +
+                    '^HID-konformer Gamecontroller$|' +
                     'game\s*controller|' +
                     'gamepad|' +
                     'joystick|' +
-                    'Xbox.*controller|' +
-                    'Xbox.*gamepad|' +
-                    'controller\s*for\s*windows|' +
                     'wireless\s*controller|' +
                     'DualShock|' +
                     'DualSense|' +
-                    'PS[345].*controller|' +
-                    'PlayStation.*controller|' +
+                    'Xbox.*controller|' +
+                    'Xbox.*gamepad|' +
+                    'controller\s*for\s*windows|' +
                     'Switch.*controller|' +
                     'Pro\s*Controller|' +
                     'Joy-?Con|' +
@@ -409,35 +433,6 @@ if ($blockController) {
                     'Thrustmaster.*(controller|gamepad)|' +
                     'virtual.*(controller|gamepad)|' +
                     'ViGEm.*controller'
-
-                $controllerClassMatch =
-                    $cls -match '(?i)' +
-                    '^(GameController|' +
-                    'XnaComposite|' +
-                    'XboxComposite)$'
-
-                $controllerIdMatch =
-                    $cls -eq 'HIDClass' -and
-                    $id -match '(?i)' +
-                    'VID_054C|' +   # Sony
-                    'VID_045E|' +   # Microsoft
-                    'VID_057E|' +   # Nintendo
-                    'VID_046D|' +   # Logitech
-                    'VID_044F|' +   # Thrustmaster
-                    'IG_0[0-9]|' +
-                    'GAMEPAD|' +
-                    'JOYSTICK'
-
-                $excludedClass =
-                    $cls -in @(
-                        'Mouse',
-                        'Keyboard',
-                        'AudioEndpoint',
-                        'MEDIA',
-                        'Bluetooth',
-                        'System',
-                        'USB'
-                    )
 
                 $excludedName =
                     $name -match '(?i)' +
@@ -461,52 +456,351 @@ if ($blockController) {
                     'Bluetooth.*adapter|' +
                     'USB.*hub'
 
-                (
-                    $controllerNameMatch -or
-                    $controllerClassMatch -or
-                    $controllerIdMatch
-                ) -and
-                -not $excludedClass -and
+                $allowedClass -and
+                $controllerName -and
                 -not $excludedName
-            } |
+            }
+    )
+
+    $targets = foreach ($leaf in $leaves) {
+        Resolve-ControllerTarget -Device $leaf
+    }
+
+    return @(
+        $targets |
+            Where-Object { $null -ne $_ } |
             Sort-Object InstanceId -Unique
     )
 }
 
 # ============================================================
-# GERÄT DEAKTIVIEREN
+# TEMP-ZUSTAND FREIGEBEN UND BEREINIGEN
 # ============================================================
 
-function Disable-IODevice {
-    param(
-        [Parameter(Mandatory)]
-        [string]$InstanceId
-    )
+function Remove-DisableIOTask {
+    param([switch]$DoNotStopRunningTask)
 
-    try {
-        Disable-PnpDevice `
-            -InstanceId $InstanceId `
-            -Confirm:$false `
-            -ErrorAction Stop
-
-        return $true
+    if (-not $DoNotStopRunningTask) {
+        Stop-ScheduledTask `
+            -TaskName $taskName `
+            -ErrorAction SilentlyContinue
     }
-    catch {
-        & pnputil.exe `
-            /disable-device "$InstanceId" `
-            /force 2>$null |
-            Out-Null
 
-        return ($LASTEXITCODE -eq 0)
+    Unregister-ScheduledTask `
+        -TaskName $taskName `
+        -Confirm:$false `
+        -ErrorAction SilentlyContinue
+
+    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        & "$env:windir\System32\schtasks.exe" `
+            /Delete /TN $taskName /F 2>$null |
+            Out-Null
     }
 }
+
+function Restore-SavedControllers {
+    if (-not (Test-Path -LiteralPath $controllerFile)) {
+        return $true
+    }
+
+    $ids = @(
+        Get-Content `
+            -LiteralPath $controllerFile `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_)
+            } |
+            Sort-Object -Unique
+    )
+
+    $failedIds = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($instanceId in $ids) {
+        $result = Enable-IODevice -InstanceId $instanceId
+
+        if (-not $result.Success) {
+            $failedIds.Add($instanceId)
+
+            Write-Warning @"
+Controller konnte nicht aktiviert werden.
+InstanceId: $instanceId
+$($result.Detail)
+"@
+        }
+    }
+
+    if ($failedIds.Count -gt 0) {
+        $failedIds |
+            Set-Content `
+                -LiteralPath $controllerFile `
+                -Force
+
+        return $false
+    }
+
+    Remove-Item `
+        -LiteralPath $controllerFile `
+        -Force `
+        -ErrorAction SilentlyContinue
+
+    return $true
+}
+
+function Stop-ExistingDisableIO {
+    param([switch]$KeepTempScript)
+
+    Remove-DisableIOTask
+
+    if (Test-Path -LiteralPath $pidFile) {
+        $savedPid = Get-Content `
+            -LiteralPath $pidFile `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+        if ($savedPid -match '^\d+$') {
+            Stop-IOProcessTree -RootProcessId ([int]$savedPid)
+        }
+    }
+
+    $controllersRestoredSuccessfully = Restore-SavedControllers
+
+    Remove-Item `
+        -LiteralPath $pidFile, $logFile `
+        -Force `
+        -ErrorAction SilentlyContinue
+
+    if (-not $controllersRestoredSuccessfully) {
+        Write-Warning (
+            'Mindestens ein Controller blieb deaktiviert. ' +
+            "Die Wiederherstellungsdaten bleiben unter $workRoot erhalten."
+        )
+
+        return $false
+    }
+
+    if ($KeepTempScript) {
+        Get-ChildItem `
+            -LiteralPath $workRoot `
+            -Force `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.FullName -ne $tempScript
+            } |
+            Remove-Item `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+    }
+    else {
+        Remove-Item `
+            -LiteralPath $workRoot `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+
+    return $true
+}
+
+# ============================================================
+# SOFORTIGE FREIGABE
+# ============================================================
+
+if ($releaseRequested) {
+    Write-Host 'Beende DisableIO und stelle Controller wieder her ...'
+    $released = Stop-ExistingDisableIO
+
+    if ($released) {
+        Write-Host 'Maus, Tastatur und Controller wurden freigegeben.'
+    }
+    else {
+        Write-Warning (
+            'Die Hooks wurden beendet, aber mindestens ein Controller ' +
+            'konnte nicht automatisch aktiviert werden.'
+        )
+    }
+
+    return
+}
+
+# ============================================================
+# BOOTSTRAP: TEMP-KOPIE + TEMPORÄRE AUFGABE
+# ============================================================
+
+if (-not $InternalWorker) {
+    New-Item `
+        -Path $workRoot `
+        -ItemType Directory `
+        -Force |
+        Out-Null
+
+    $currentScriptPath = $null
+    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        try {
+            $currentScriptPath = [IO.Path]::GetFullPath($PSCommandPath)
+        }
+        catch {
+            $currentScriptPath = $null
+        }
+    }
+
+    $runningFromTemp =
+        -not [string]::IsNullOrWhiteSpace($currentScriptPath) -and
+        [string]::Equals(
+            $currentScriptPath,
+            [IO.Path]::GetFullPath($tempScript),
+            [StringComparison]::OrdinalIgnoreCase
+        )
+
+    $oldRunCleared = Stop-ExistingDisableIO `
+        -KeepTempScript:$runningFromTemp
+
+    if (-not $oldRunCleared) {
+        throw (
+            'Ein zuvor deaktivierter Controller konnte nicht wieder ' +
+            'aktiviert werden. Neuer Lauf wurde abgebrochen.'
+        )
+    }
+
+    New-Item `
+        -Path $workRoot `
+        -ItemType Directory `
+        -Force |
+        Out-Null
+
+    if (-not $runningFromTemp) {
+        if (
+            -not [string]::IsNullOrWhiteSpace($currentScriptPath) -and
+            (Test-Path -LiteralPath $currentScriptPath)
+        ) {
+            Copy-Item `
+                -LiteralPath $currentScriptPath `
+                -Destination $tempScript `
+                -Force
+        }
+        else {
+            Invoke-WebRequest `
+                -UseBasicParsing `
+                -Uri $SourceUrl `
+                -OutFile $tempScript
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $tempScript)) {
+        throw "Temporäre Skriptdatei wurde nicht erstellt: $tempScript"
+    }
+
+    $interactiveUser = (
+        Get-CimInstance Win32_ComputerSystem
+    ).UserName
+
+    if ([string]::IsNullOrWhiteSpace($interactiveUser)) {
+        throw 'Kein interaktiv angemeldeter Windows-Benutzer gefunden.'
+    }
+
+    $workerArguments = [System.Collections.Generic.List[string]]::new()
+    $workerArguments.Add('-NoProfile')
+    $workerArguments.Add('-NonInteractive')
+    $workerArguments.Add('-ExecutionPolicy Bypass')
+    $workerArguments.Add('-WindowStyle Hidden')
+    $workerArguments.Add("-File `"$tempScript`"")
+    $workerArguments.Add('-InternalWorker')
+    $workerArguments.Add("-Duration $Duration")
+    $workerArguments.Add("-ControllerDuration $ControllerDuration")
+
+    if (-not $blockMouse) {
+        $workerArguments.Add('-NoMouse')
+    }
+
+    if (-not $blockKeyboard) {
+        $workerArguments.Add('-NoKeyboard')
+    }
+
+    if (-not $blockController) {
+        $workerArguments.Add('-NoController')
+    }
+
+    $action = New-ScheduledTaskAction `
+        -Execute "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -Argument ($workerArguments -join ' ') `
+        -WorkingDirectory ([IO.Path]::GetTempPath())
+
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId $interactiveUser `
+        -LogonType Interactive `
+        -RunLevel Highest
+
+    $maximumDuration = [Math]::Max(
+        $Duration,
+        $ControllerDuration
+    )
+
+    $settings = New-ScheduledTaskSettingsSet `
+        -ExecutionTimeLimit (
+            New-TimeSpan -Seconds ($maximumDuration + 180)
+        ) `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -MultipleInstances IgnoreNew `
+        -Hidden
+
+    try {
+        Register-ScheduledTask `
+            -TaskName $taskName `
+            -Action $action `
+            -Principal $principal `
+            -Settings $settings `
+            -Force |
+            Out-Null
+
+        Start-ScheduledTask -TaskName $taskName
+    }
+    catch {
+        Stop-ExistingDisableIO
+        throw
+    }
+
+    Write-Host "DisableIO wurde für $interactiveUser gestartet."
+    Write-Host "Maus/Tastatur: $Duration Sekunden"
+    Write-Host "Controller:    $ControllerDuration Sekunden"
+    Write-Host "Temp-Ordner:   $workRoot"
+    Write-Host ''
+    Write-Host 'Notfallfreigabe:'
+    Write-Host "`$enableIO=`$true;irm '$SourceUrl'|iex"
+    return
+}
+
+# ============================================================
+# INTERAKTIVER WORKER
+# ============================================================
+
+New-Item `
+    -Path $workRoot `
+    -ItemType Directory `
+    -Force |
+    Out-Null
+
+$PID |
+    Set-Content `
+        -LiteralPath $pidFile `
+        -Force
+
+Write-Host ''
+Write-Host '================ DisableIO ================'
+Write-Host "Maus/Tastatur: $Duration Sekunden"
+Write-Host "Controller:    $ControllerDuration Sekunden"
+Write-Host "Maus:          $blockMouse"
+Write-Host "Tastatur:      $blockKeyboard"
+Write-Host "Controller:    $blockController"
+Write-Host '==========================================='
+Write-Host ''
 
 # ============================================================
 # MAUSPOSITION FESTHALTEN
 # ============================================================
 
 $mousePositionJob = {
-    param([int]$Duration)
+    param([int]$Seconds)
 
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -514,10 +808,9 @@ $mousePositionJob = {
     $position = [System.Windows.Forms.Cursor]::Position
     $x = $position.X
     $y = $position.Y
+    $endTime = [DateTime]::UtcNow.AddSeconds($Seconds)
 
-    $endTime = (Get-Date).AddSeconds($Duration)
-
-    while ((Get-Date) -lt $endTime) {
+    while ([DateTime]::UtcNow -lt $endTime) {
         [System.Windows.Forms.Cursor]::Position =
             [System.Drawing.Point]::new($x, $y)
 
@@ -542,22 +835,20 @@ public static class DisableIOMouseHook
 {
     private const int WH_MOUSE_LL = 14;
 
-    private const int WM_MOUSEMOVE    = 0x0200;
-    private const int WM_LBUTTONDOWN  = 0x0201;
-    private const int WM_LBUTTONUP    = 0x0202;
-    private const int WM_RBUTTONDOWN  = 0x0204;
-    private const int WM_RBUTTONUP    = 0x0205;
-    private const int WM_MBUTTONDOWN  = 0x0207;
-    private const int WM_MBUTTONUP    = 0x0208;
-    private const int WM_MOUSEWHEEL   = 0x020A;
-    private const int WM_XBUTTONDOWN  = 0x020B;
-    private const int WM_XBUTTONUP    = 0x020C;
-    private const int WM_MOUSEHWHEEL  = 0x020E;
+    private const int WM_MOUSEMOVE   = 0x0200;
+    private const int WM_LBUTTONDOWN = 0x0201;
+    private const int WM_LBUTTONUP   = 0x0202;
+    private const int WM_RBUTTONDOWN = 0x0204;
+    private const int WM_RBUTTONUP   = 0x0205;
+    private const int WM_MBUTTONDOWN = 0x0207;
+    private const int WM_MBUTTONUP   = 0x0208;
+    private const int WM_MOUSEWHEEL  = 0x020A;
+    private const int WM_XBUTTONDOWN = 0x020B;
+    private const int WM_XBUTTONUP   = 0x020C;
+    private const int WM_MOUSEHWHEEL = 0x020E;
 
     private static IntPtr hookId = IntPtr.Zero;
-
-    private static readonly LowLevelMouseProc callback =
-        HookCallback;
+    private static readonly LowLevelMouseProc callback = HookCallback;
 
     public static void Run(int durationMilliseconds)
     {
@@ -572,24 +863,13 @@ public static class DisableIOMouseHook
 
         try
         {
-            DateTime end =
-                DateTime.UtcNow.AddMilliseconds(
-                    durationMilliseconds
-                );
+            DateTime end = DateTime.UtcNow.AddMilliseconds(durationMilliseconds);
 
             while (DateTime.UtcNow < end)
             {
                 MSG message;
 
-                while (
-                    PeekMessage(
-                        out message,
-                        IntPtr.Zero,
-                        0,
-                        0,
-                        1
-                    )
-                )
+                while (PeekMessage(out message, IntPtr.Zero, 0, 0, 1))
                 {
                     TranslateMessage(ref message);
                     DispatchMessage(ref message);
@@ -608,25 +888,15 @@ public static class DisableIOMouseHook
         }
     }
 
-    private static IntPtr SetHook(
-        LowLevelMouseProc proc
-    )
+    private static IntPtr SetHook(LowLevelMouseProc proc)
     {
-        using (
-            Process process =
-                Process.GetCurrentProcess()
-        )
-        using (
-            ProcessModule module =
-                process.MainModule
-        )
+        using (Process process = Process.GetCurrentProcess())
+        using (ProcessModule module = process.MainModule)
         {
             return SetWindowsHookEx(
                 WH_MOUSE_LL,
                 proc,
-                GetModuleHandle(
-                    module.ModuleName
-                ),
+                GetModuleHandle(module.ModuleName),
                 0
             );
         }
@@ -665,12 +935,7 @@ public static class DisableIOMouseHook
             }
         }
 
-        return CallNextHookEx(
-            hookId,
-            nCode,
-            wParam,
-            lParam
-        );
+        return CallNextHookEx(hookId, nCode, wParam, lParam);
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -691,10 +956,7 @@ public static class DisableIOMouseHook
         public int y;
     }
 
-    [DllImport(
-        "user32.dll",
-        SetLastError = true
-    )]
+    [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr SetWindowsHookEx(
         int idHook,
         LowLevelMouseProc lpfn,
@@ -702,13 +964,8 @@ public static class DisableIOMouseHook
         uint threadId
     );
 
-    [DllImport(
-        "user32.dll",
-        SetLastError = true
-    )]
-    private static extern bool UnhookWindowsHookEx(
-        IntPtr hook
-    );
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hook);
 
     [DllImport("user32.dll")]
     private static extern IntPtr CallNextHookEx(
@@ -718,13 +975,8 @@ public static class DisableIOMouseHook
         IntPtr lParam
     );
 
-    [DllImport(
-        "kernel32.dll",
-        CharSet = CharSet.Auto
-    )]
-    private static extern IntPtr GetModuleHandle(
-        string moduleName
-    );
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
+    private static extern IntPtr GetModuleHandle(string moduleName);
 
     [DllImport("user32.dll")]
     private static extern bool PeekMessage(
@@ -736,20 +988,14 @@ public static class DisableIOMouseHook
     );
 
     [DllImport("user32.dll")]
-    private static extern bool TranslateMessage(
-        ref MSG message
-    );
+    private static extern bool TranslateMessage(ref MSG message);
 
     [DllImport("user32.dll")]
-    private static extern IntPtr DispatchMessage(
-        ref MSG message
-    );
+    private static extern IntPtr DispatchMessage(ref MSG message);
 }
 "@
 
-    [DisableIOMouseHook]::Run(
-        $DurationMilliseconds
-    )
+    [DisableIOMouseHook]::Run($DurationMilliseconds)
 }
 
 # ============================================================
@@ -775,9 +1021,7 @@ public static class DisableIOKeyboardHook
     private const int WM_SYSKEYUP   = 0x0105;
 
     private static IntPtr hookId = IntPtr.Zero;
-
-    private static readonly LowLevelKeyboardProc callback =
-        HookCallback;
+    private static readonly LowLevelKeyboardProc callback = HookCallback;
 
     public static void Run(int durationMilliseconds)
     {
@@ -792,24 +1036,13 @@ public static class DisableIOKeyboardHook
 
         try
         {
-            DateTime end =
-                DateTime.UtcNow.AddMilliseconds(
-                    durationMilliseconds
-                );
+            DateTime end = DateTime.UtcNow.AddMilliseconds(durationMilliseconds);
 
             while (DateTime.UtcNow < end)
             {
                 MSG message;
 
-                while (
-                    PeekMessage(
-                        out message,
-                        IntPtr.Zero,
-                        0,
-                        0,
-                        1
-                    )
-                )
+                while (PeekMessage(out message, IntPtr.Zero, 0, 0, 1))
                 {
                     TranslateMessage(ref message);
                     DispatchMessage(ref message);
@@ -828,25 +1061,15 @@ public static class DisableIOKeyboardHook
         }
     }
 
-    private static IntPtr SetHook(
-        LowLevelKeyboardProc proc
-    )
+    private static IntPtr SetHook(LowLevelKeyboardProc proc)
     {
-        using (
-            Process process =
-                Process.GetCurrentProcess()
-        )
-        using (
-            ProcessModule module =
-                process.MainModule
-        )
+        using (Process process = Process.GetCurrentProcess())
+        using (ProcessModule module = process.MainModule)
         {
             return SetWindowsHookEx(
                 WH_KEYBOARD_LL,
                 proc,
-                GetModuleHandle(
-                    module.ModuleName
-                ),
+                GetModuleHandle(module.ModuleName),
                 0
             );
         }
@@ -879,12 +1102,7 @@ public static class DisableIOKeyboardHook
             }
         }
 
-        return CallNextHookEx(
-            hookId,
-            nCode,
-            wParam,
-            lParam
-        );
+        return CallNextHookEx(hookId, nCode, wParam, lParam);
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -905,10 +1123,7 @@ public static class DisableIOKeyboardHook
         public int y;
     }
 
-    [DllImport(
-        "user32.dll",
-        SetLastError = true
-    )]
+    [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr SetWindowsHookEx(
         int idHook,
         LowLevelKeyboardProc lpfn,
@@ -916,13 +1131,8 @@ public static class DisableIOKeyboardHook
         uint threadId
     );
 
-    [DllImport(
-        "user32.dll",
-        SetLastError = true
-    )]
-    private static extern bool UnhookWindowsHookEx(
-        IntPtr hook
-    );
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hook);
 
     [DllImport("user32.dll")]
     private static extern IntPtr CallNextHookEx(
@@ -932,13 +1142,8 @@ public static class DisableIOKeyboardHook
         IntPtr lParam
     );
 
-    [DllImport(
-        "kernel32.dll",
-        CharSet = CharSet.Auto
-    )]
-    private static extern IntPtr GetModuleHandle(
-        string moduleName
-    );
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
+    private static extern IntPtr GetModuleHandle(string moduleName);
 
     [DllImport("user32.dll")]
     private static extern bool PeekMessage(
@@ -950,55 +1155,23 @@ public static class DisableIOKeyboardHook
     );
 
     [DllImport("user32.dll")]
-    private static extern bool TranslateMessage(
-        ref MSG message
-    );
+    private static extern bool TranslateMessage(ref MSG message);
 
     [DllImport("user32.dll")]
-    private static extern IntPtr DispatchMessage(
-        ref MSG message
-    );
+    private static extern IntPtr DispatchMessage(ref MSG message);
 }
 "@
 
-    [DisableIOKeyboardHook]::Run(
-        $DurationMilliseconds
-    )
-}
-
-# ============================================================
-# CONTROLLER-WIEDERHERSTELLUNGSJOB
-# ============================================================
-
-$controllerRestoreJob = {
-    param(
-        [string[]]$InstanceIds,
-        [int]$Duration
-    )
-
-    Start-Sleep -Seconds $Duration
-
-    foreach ($instanceId in $InstanceIds) {
-        try {
-            Enable-PnpDevice `
-                -InstanceId $instanceId `
-                -Confirm:$false `
-                -ErrorAction Stop
-        }
-        catch {
-            & pnputil.exe `
-                /enable-device "$instanceId" 2>$null |
-                Out-Null
-        }
-    }
+    [DisableIOKeyboardHook]::Run($DurationMilliseconds)
 }
 
 # ============================================================
 # AUSFÜHRUNG
 # ============================================================
 
-$jobs = [System.Collections.Generic.List[object]]::new()
 $disabledControllerIds = @()
+$controllerRestoreAttempted = $false
+$controllerRestoreSucceeded = $true
 
 try {
     Get-Job `
@@ -1014,11 +1187,9 @@ try {
             -Force `
             -ErrorAction SilentlyContinue
 
-    # --------------------------------------------------------
-    # Controller deaktivieren
-    # --------------------------------------------------------
-
     if ($blockController) {
+        $controllers = @(Get-ControllerTargets)
+
         if ($controllers.Count -eq 0) {
             Write-Warning 'Kein Gamecontroller gefunden.'
         }
@@ -1028,92 +1199,80 @@ try {
                     'Deaktiviere Controller: {0}' -f
                     $controller.FriendlyName
                 )
+                Write-Host "InstanceId: $($controller.InstanceId)"
 
-                if (
-                    Disable-IODevice `
-                        -InstanceId $controller.InstanceId
-                ) {
-                    $disabledControllerIds +=
-                        $controller.InstanceId
+                $result = Disable-IODevice `
+                    -InstanceId $controller.InstanceId
+
+                if ($result.Success) {
+                    $disabledControllerIds += $controller.InstanceId
+                    $disabledControllerIds = @(
+                        $disabledControllerIds |
+                            Sort-Object -Unique
+                    )
+
+                    $disabledControllerIds |
+                        Set-Content `
+                            -LiteralPath $controllerFile `
+                            -Force
                 }
                 else {
-                    Write-Warning (
-                        'Controller konnte nicht deaktiviert werden: {0}' -f
-                        $controller.FriendlyName
-                    )
+                    Write-Warning @"
+Controller konnte nicht deaktiviert werden: $($controller.FriendlyName)
+InstanceId: $($controller.InstanceId)
+$($result.Detail)
+"@
                 }
             }
 
-            $disabledControllerIds =
-                @(
-                    $disabledControllerIds |
-                        Sort-Object -Unique
-                )
-
-            if ($disabledControllerIds.Count -gt 0) {
-                $disabledControllerIds |
-                    Set-Content `
-                        -LiteralPath $controllerFile `
-                        -Force
-
-                $controllerJob = Start-Job `
-                    -Name 'DisableIO-ControllerRestore' `
-                    -ScriptBlock $controllerRestoreJob `
-                    -ArgumentList (
-                        ,$disabledControllerIds
-                    ), $CSeconds
-
-                $jobs.Add($controllerJob)
-            }
         }
     }
 
-    # --------------------------------------------------------
-    # Maus blockieren
-    # --------------------------------------------------------
-
     if ($blockMouse) {
-        $positionJob = Start-Job `
+        Start-Job `
             -Name 'DisableIO-MousePosition' `
             -ScriptBlock $mousePositionJob `
-            -ArgumentList $seconds
+            -ArgumentList $Duration |
+            Out-Null
 
-        $jobs.Add($positionJob)
-
-        $mouseJob = Start-Job `
+        Start-Job `
             -Name 'DisableIO-MouseHook' `
             -ScriptBlock $mouseHookJob `
-            -ArgumentList ($seconds * 1000)
-
-        $jobs.Add($mouseJob)
+            -ArgumentList ($Duration * 1000) |
+            Out-Null
     }
-
-    # --------------------------------------------------------
-    # Tastatur blockieren
-    # --------------------------------------------------------
 
     if ($blockKeyboard) {
-        $keyboardJob = Start-Job `
+        Start-Job `
             -Name 'DisableIO-KeyboardHook' `
             -ScriptBlock $keyboardHookJob `
-            -ArgumentList ($seconds * 1000)
-
-        $jobs.Add($keyboardJob)
+            -ArgumentList ($Duration * 1000) |
+            Out-Null
     }
 
-    # Prozess bleibt bis zum längsten Timer aktiv.
-    $totalDuration = [Math]::Max(
-        $seconds,
-        $CSeconds
-    )
+    $startTime = [DateTime]::UtcNow
+    $inputEnd = $startTime.AddSeconds($Duration)
+    $controllerEnd = $startTime.AddSeconds($ControllerDuration)
+    $totalEnd = if ($inputEnd -gt $controllerEnd) {
+        $inputEnd
+    }
+    else {
+        $controllerEnd
+    }
 
-    Start-Sleep -Seconds $totalDuration
+    while ([DateTime]::UtcNow -lt $totalEnd) {
+        if (
+            -not $controllerRestoreAttempted -and
+            [DateTime]::UtcNow -ge $controllerEnd
+        ) {
+            $controllerRestoreSucceeded = Restore-SavedControllers
+            $controllerRestoreAttempted = $true
+        }
+
+        Start-Sleep -Milliseconds 200
+    }
 }
 finally {
-    # --------------------------------------------------------
-    # Alle Hooks und Jobs beenden
-    # --------------------------------------------------------
-
     Get-Job `
         -Name 'DisableIO-*' `
         -ErrorAction SilentlyContinue |
@@ -1134,32 +1293,31 @@ finally {
             -Force `
             -ErrorAction SilentlyContinue
 
-    # --------------------------------------------------------
-    # Tatsächlich deaktivierte Controller aktivieren
-    # --------------------------------------------------------
-
-    if (Test-Path -LiteralPath $controllerFile) {
-        $idsToRestore = @(
-            Get-Content `
-                -LiteralPath $controllerFile `
-                -ErrorAction SilentlyContinue |
-                Where-Object {
-                    -not [string]::IsNullOrWhiteSpace($_)
-                } |
-                Sort-Object -Unique
-        )
-
-        foreach ($id in $idsToRestore) {
-            Enable-IODevice -InstanceId $id |
-                Out-Null
-        }
+    if (-not $controllerRestoreAttempted) {
+        $controllerRestoreSucceeded = Restore-SavedControllers
+        $controllerRestoreAttempted = $true
     }
 
     Remove-Item `
-        -LiteralPath $controllerFile, $pidFile `
+        -LiteralPath $pidFile, $logFile `
         -Force `
         -ErrorAction SilentlyContinue
 
-    Write-Host 'Alle ausgewählten Eingaben wurden wieder freigegeben.'
+    Remove-DisableIOTask -DoNotStopRunningTask
+
+    if ($controllerRestoreSucceeded) {
+        Write-Host 'Alle ausgewählten Eingaben wurden wieder freigegeben.'
+
+        Remove-Item `
+            -LiteralPath $workRoot `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+    else {
+        Write-Warning (
+            'Maus und Tastatur wurden freigegeben, aber mindestens ein ' +
+            "Controller blieb deaktiviert. Status: $controllerFile"
+        )
+    }
 }
-```
