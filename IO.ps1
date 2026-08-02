@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 #requires -RunAsAdministrator
 
 [CmdletBinding()]
@@ -388,10 +388,7 @@ function Resolve-ControllerTarget {
     )
 
     if ($bluetoothTargets.Count -gt 0) {
-        # Den obersten gerätespezifischen Bluetooth-Knoten wählen,
-        # damit der komplette Controller und nicht nur eine HID-Funktion
-        # deaktiviert wird.
-        return $bluetoothTargets[-1]
+        return $bluetoothTargets[0]
     }
 
     # Virtuelle oder nicht auflösbare Controller: den erkannten
@@ -474,48 +471,6 @@ function Get-ControllerTargets {
             Where-Object { $null -ne $_ } |
             Sort-Object InstanceId -Unique
     )
-}
-
-# ============================================================
-# DEAKTIVIERTE CONTROLLER SOFORT IN TEMP SICHERN
-# ============================================================
-
-function Save-DisabledControllerId {
-    param(
-        [Parameter(Mandatory)]
-        [string]$InstanceId
-    )
-
-    New-Item `
-        -Path $workRoot `
-        -ItemType Directory `
-        -Force |
-        Out-Null
-
-    $savedIds = @()
-
-    if (Test-Path -LiteralPath $controllerFile) {
-        $savedIds = @(
-            Get-Content `
-                -LiteralPath $controllerFile `
-                -ErrorAction SilentlyContinue |
-                Where-Object {
-                    -not [string]::IsNullOrWhiteSpace($_)
-                }
-        )
-    }
-
-    $savedIds = @(
-        $savedIds
-        $InstanceId
-    ) |
-        Sort-Object -Unique
-
-    $savedIds |
-        Set-Content `
-            -LiteralPath $controllerFile `
-            -Encoding Unicode `
-            -Force
 }
 
 # ============================================================
@@ -1212,23 +1167,11 @@ public static class DisableIOKeyboardHook
 
 # ============================================================
 # AUSFÜHRUNG
-#
-# Während der gesamten Controller-Zeit wird alle 250 ms erneut
-# nach Gamecontrollern gesucht. Dadurch werden auch Controller
-# deaktiviert, die erst nach dem Start per USB oder Bluetooth
-# verbunden werden.
 # ============================================================
 
+$disabledControllerIds = @()
 $controllerRestoreAttempted = $false
 $controllerRestoreSucceeded = $true
-$controllerPollMilliseconds = 250
-
-# Verhindert Befehlsfluten, solange Windows einen neu erkannten
-# Geräteknoten noch vollständig einrichtet.
-$controllerLastAttempt = @{}
-$controllerLastWarning = @{}
-$controllerSeenAtLeastOnce = $false
-$controllerEmptyMessageShown = $false
 
 try {
     Get-Job `
@@ -1244,15 +1187,45 @@ try {
             -Force `
             -ErrorAction SilentlyContinue
 
-    $startTime = [DateTime]::UtcNow
-    $inputEnd = $startTime.AddSeconds($Duration)
-    $controllerEnd = $startTime.AddSeconds($ControllerDuration)
+    if ($blockController) {
+        $controllers = @(Get-ControllerTargets)
 
-    $totalEnd = if ($inputEnd -gt $controllerEnd) {
-        $inputEnd
-    }
-    else {
-        $controllerEnd
+        if ($controllers.Count -eq 0) {
+            Write-Warning 'Kein Gamecontroller gefunden.'
+        }
+        else {
+            foreach ($controller in $controllers) {
+                Write-Host (
+                    'Deaktiviere Controller: {0}' -f
+                    $controller.FriendlyName
+                )
+                Write-Host "InstanceId: $($controller.InstanceId)"
+
+                $result = Disable-IODevice `
+                    -InstanceId $controller.InstanceId
+
+                if ($result.Success) {
+                    $disabledControllerIds += $controller.InstanceId
+                    $disabledControllerIds = @(
+                        $disabledControllerIds |
+                            Sort-Object -Unique
+                    )
+
+                    $disabledControllerIds |
+                        Set-Content `
+                            -LiteralPath $controllerFile `
+                            -Force
+                }
+                else {
+                    Write-Warning @"
+Controller konnte nicht deaktiviert werden: $($controller.FriendlyName)
+InstanceId: $($controller.InstanceId)
+$($result.Detail)
+"@
+                }
+            }
+
+        }
     }
 
     if ($blockMouse) {
@@ -1277,156 +1250,26 @@ try {
             Out-Null
     }
 
-    if ($blockController) {
-        Write-Host (
-            'Controller-Überwachung aktiv: vorhandene und neu ' +
-            'verbundene Controller werden gesperrt.'
-        )
+    $startTime = [DateTime]::UtcNow
+    $inputEnd = $startTime.AddSeconds($Duration)
+    $controllerEnd = $startTime.AddSeconds($ControllerDuration)
+    $totalEnd = if ($inputEnd -gt $controllerEnd) {
+        $inputEnd
+    }
+    else {
+        $controllerEnd
     }
 
-    $nextControllerScan = $startTime
-
     while ([DateTime]::UtcNow -lt $totalEnd) {
-        $now = [DateTime]::UtcNow
-
-        # ----------------------------------------------------
-        # Vorhandene und neu angeschlossene Controller sperren
-        # ----------------------------------------------------
-
-        if (
-            $blockController -and
-            -not $controllerRestoreAttempted -and
-            $now -lt $controllerEnd -and
-            $now -ge $nextControllerScan
-        ) {
-            $targets = @(Get-ControllerTargets)
-
-            if ($targets.Count -eq 0) {
-                if (-not $controllerEmptyMessageShown) {
-                    Write-Host (
-                        'Aktuell kein Gamecontroller erkannt; ' +
-                        'Neuanschlüsse werden weiter überwacht.'
-                    )
-                    $controllerEmptyMessageShown = $true
-                }
-            }
-            else {
-                $controllerSeenAtLeastOnce = $true
-                $controllerEmptyMessageShown = $false
-
-                foreach ($controller in $targets) {
-                    # Die Zeit nach jedem PnP-Aufruf erneut prüfen.
-                    $now = [DateTime]::UtcNow
-                    if ($now -ge $controllerEnd) {
-                        break
-                    }
-
-                    $instanceId = [string]$controller.InstanceId
-                    if ([string]::IsNullOrWhiteSpace($instanceId)) {
-                        continue
-                    }
-
-                    # Ein erfolgreicher Disable-Aufruf entfernt das Gerät
-                    # normalerweise aus PresentOnly. Solange Windows dies
-                    # noch nicht umgesetzt hat, maximal einmal pro Sekunde
-                    # erneut versuchen.
-                    if ($controllerLastAttempt.ContainsKey($instanceId)) {
-                        $elapsed = (
-                            $now -
-                            [DateTime]$controllerLastAttempt[$instanceId]
-                        ).TotalMilliseconds
-
-                        if ($elapsed -lt 1000) {
-                            continue
-                        }
-                    }
-
-                    $controllerLastAttempt[$instanceId] = $now
-
-                    Write-Host (
-                        'Deaktiviere Controller: {0}' -f
-                        $controller.FriendlyName
-                    )
-                    Write-Host "InstanceId: $instanceId"
-
-                    $result = Disable-IODevice `
-                        -InstanceId $instanceId
-
-                    if ($result.Success) {
-                        # Sofort speichern, damit Notfallfreigabe und
-                        # Prozessabbruch das Gerät wieder aktivieren können.
-                        Save-DisabledControllerId `
-                            -InstanceId $instanceId
-
-                        Write-Host (
-                            'Controller gesperrt über {0}.' -f
-                            $result.Detail
-                        )
-
-                        [void]$controllerLastWarning.Remove($instanceId)
-                    }
-                    else {
-                        # Bei noch nicht fertig enumerierten USB-/Bluetooth-
-                        # Geräten erneut versuchen, Warnungen aber höchstens
-                        # alle fünf Sekunden ausgeben.
-                        $showWarning = $true
-
-                        if ($controllerLastWarning.ContainsKey($instanceId)) {
-                            $warningElapsed = (
-                                $now -
-                                [DateTime]$controllerLastWarning[$instanceId]
-                            ).TotalSeconds
-
-                            $showWarning = $warningElapsed -ge 5
-                        }
-
-                        if ($showWarning) {
-                            $controllerLastWarning[$instanceId] = $now
-
-                            Write-Warning @"
-Controller konnte noch nicht deaktiviert werden: $($controller.FriendlyName)
-InstanceId: $instanceId
-$($result.Detail)
-Die Überwachung versucht es bis zum Ablauf erneut.
-"@
-                        }
-                    }
-                }
-            }
-
-            $nextControllerScan = [DateTime]::UtcNow.AddMilliseconds(
-                $controllerPollMilliseconds
-            )
-        }
-
-        # ----------------------------------------------------
-        # Controller exakt nach ihrer eigenen Dauer freigeben
-        # ----------------------------------------------------
-
         if (
             -not $controllerRestoreAttempted -and
-            $now -ge $controllerEnd
+            [DateTime]::UtcNow -ge $controllerEnd
         ) {
             $controllerRestoreSucceeded = Restore-SavedControllers
             $controllerRestoreAttempted = $true
-
-            if ($controllerRestoreSucceeded) {
-                if ($controllerSeenAtLeastOnce) {
-                    Write-Host (
-                        'Controller-Sperre beendet; alle gespeicherten ' +
-                        'Controller wurden wieder aktiviert.'
-                    )
-                }
-                else {
-                    Write-Host (
-                        'Controller-Sperre beendet; während der Laufzeit ' +
-                        'wurde kein Controller erkannt.'
-                    )
-                }
-            }
         }
 
-        Start-Sleep -Milliseconds 50
+        Start-Sleep -Milliseconds 200
     }
 }
 finally {
